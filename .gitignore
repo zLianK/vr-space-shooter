@@ -112,3 +112,7 @@ InitTestScene*.unity*
 
 # Auto-generated cache in Assets folder
 /[Aa]ssets/[Ss]ceneDependencyCache*
+
+#
+/vr-space-shooter_BackUpThisFolder_ButDontShipItWithYourGame
+/vr-space-shooter_BurstDebugInformation_DoNotShip

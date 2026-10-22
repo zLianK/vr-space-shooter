@@ -577,6 +577,10 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: d5b2f8a1c7364e90a4e1b8c3f7d20a59, type: 3}
   m_Name:
   m_EditorClassIdentifier:
+  shipPrefab: {fileID: 1578558564194034, guid: 50d56e9319acd7440a97582160b01520, type: 3}
+  cockpitHeight: 1.6
+  eyePosition: {x: 0, y: 0.1, z: 0}
+  seatOffset: {x: 0, y: -0.4, z: 0}
   hull: {fileID: 2100000, guid: f1a7c3d2b8e54a60b9d4e2c7a5f03b18, type: 2}
   accent: {fileID: 2100000, guid: 0b4e9d27a6c14f83b5a1d8e3c6f29a74, type: 2}
   glass: {fileID: 2100000, guid: 7c2a5e90d3b14f68a8c0e4b1d9f36a25, type: 2}
@@ -625,6 +629,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 9c04e7b1a5d34f28b6e1d3a7c8f05b92, type: 3}
   m_Name:
   m_EditorClassIdentifier:
+  asteroidGroup: {fileID: 5175985642886935339, guid: 40eef8e8ad2ef754e8ff32abf724db72, type: 3}
   material: {fileID: 2100000, guid: 6b7d3e18f4a9420c8d15a2e9c0b4f731, type: 2}
 --- !u!114 &700000031
 MonoBehaviour:

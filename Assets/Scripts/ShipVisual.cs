@@ -21,6 +21,55 @@ public class ShipVisual : MonoBehaviour
     const float Front = 1.1f;
     const float Wall = 0.05f;
 
+    [Header("Ship model")]
+    [Tooltip("When set, this ship replaces the primitive cockpit. Must have its interior at the pilot's seat.")]
+    [SerializeField] GameObject shipPrefab;
+    [Tooltip("Cockpit height in meters the model is scaled to (0 = keep the model's own scale).")]
+    [SerializeField] float cockpitHeight = 1.6f;
+    [Tooltip("Pilot eye position (local to the player) that the cockpit is centered on.")]
+    [SerializeField] Vector3 eyePosition = new Vector3(0f, 0.1f, 0f);
+    [Tooltip("Where the seat sits relative to the eye (negative Y = seat below the eyes). Fine-tune the pilot position here.")]
+    [SerializeField] Vector3 seatOffset = new Vector3(0f, -0.4f, 0f);
+
+    [Header("Throttle lever")]
+    [Tooltip("Degrees the lever tilts forward per throttle level.")]
+    [SerializeField] float leverAngleStep = 20f;
+    [SerializeField] float leverSpeed = 120f;
+    [Tooltip("VR: how close (meters) the right controller's pointing ray must pass to the lever to select it.")]
+    [SerializeField] float leverGrabRadius = 0.15f;
+    [Tooltip("VR: hand travel in meters along the ship's forward axis per throttle level.")]
+    [SerializeField] float leverTravelPerLevel = 0.08f;
+    [Tooltip("Tint of the lever while it is pointed at or held.")]
+    [SerializeField] Color leverHighlight = new Color(1f, 0.8f, 0.2f);
+
+    [Header("Weapon switches")]
+    [Tooltip("Names of the three cockpit switches (left of the panel) that select weapon 1, 2 and 3.")]
+    [SerializeField] string[] weaponSwitchNames =
+        { "CockpitEquipments_Switch2-1", "CockpitEquipments_Switch2-2", "CockpitEquipments_Switch2-3" };
+    [Tooltip("Degrees the selected switch tips sideways (around the ship's forward axis). Unselected ones stay up. Negative flips the side.")]
+    [SerializeField] float switchTiltAngle = 40f;
+    [SerializeField] float switchTiltSpeed = 240f;
+    [Tooltip("Strength of the glow (emission and a small light) on the selected switch.")]
+    [SerializeField] float switchGlow = 3f;
+    [Tooltip("VR: how close (meters) the pointing ray must pass to a switch to select it.")]
+    [SerializeField] float switchPickRadius = 0.04f;
+
+    [Header("Gauges")]
+    [Tooltip("Cockpit gauge face that shows how many asteroids were destroyed.")]
+    [SerializeField] string counterGaugeName = "CockpitEquipments_Gauge1-Screen";
+    [SerializeField] Color counterColor = new Color(0.3f, 1f, 0.9f);
+    [Tooltip("Cockpit gauge face that shows the countdown.")]
+    [SerializeField] string timerGaugeName = "CockpitEquipments_Gauge2-Screen";
+    [SerializeField] Color timerColor = new Color(1f, 0.8f, 0.2f);
+    [SerializeField] Color timerLowColor = new Color(1f, 0.25f, 0.2f);
+    [Tooltip("The timer turns to the low color at or below this many seconds.")]
+    [SerializeField] float timerLowSeconds = 10f;
+    [Tooltip("Blank the printed dial of that gauge (its numbers are part of the texture) so only the counter shows.")]
+    [SerializeField] bool blankGaugeFace = true;
+    [Tooltip("Digit height as a share of the gauge face.")]
+    [SerializeField] float counterSize = 0.4f;
+
+    [Header("Primitive cockpit (used when no ship model is set)")]
     [Tooltip("Dark structure (frame, panels).")]
     [SerializeField] Material hull;
     [Tooltip("Neon trim lines.")]
@@ -30,9 +79,489 @@ public class ShipVisual : MonoBehaviour
     [Tooltip("Warm indicator lights.")]
     [SerializeField] Material engine;
 
+    PlayerController player;
+    Transform[] leverHandles;
+    Vector3[] leverPositions;
+    Quaternion[] leverRotations;
+    Transform leverPivot;
+    float leverAngle;
+    ShipWeapons weapons;
+    int[] switchState;
+    int hoverMask; // bit i set = a controller points at weapon switch i
+    Renderer[] leverRenderers;
+    MaterialPropertyBlock leverBlock;
+    bool leverTinted;
+
+    // One per controller: both hands can point at and press every cockpit control.
+    // To add a control: pick it in UpdatePointer (ray test), react to `pressed` (rising edge) / `down` (held).
+    class Pointer
+    {
+        public UnityEngine.XR.XRNode node;
+        public bool wasDown, holdingLever, hoverLever;
+        public int hoverSwitch = -1;
+        public float grabHandAxis;
+        public int grabLevel;
+    }
+
+    readonly Pointer[] pointers =
+    {
+        new Pointer { node = UnityEngine.XR.XRNode.LeftHand },
+        new Pointer { node = UnityEngine.XR.XRNode.RightHand },
+    };
+
     void Start()
     {
-        Build();
+        player = GetComponent<PlayerController>();
+        weapons = GetComponent<ShipWeapons>();
+        if (shipPrefab != null) BuildFromPrefab();
+        else Build();
+    }
+
+    // Instantiates the ship model and moves it so the pilot's eye sits inside its cockpit.
+    void BuildFromPrefab()
+    {
+        var ship = Instantiate(shipPrefab, transform);
+        ship.name = "Ship";
+        ship.transform.localPosition = Vector3.zero;
+        ship.transform.localRotation = Quaternion.identity;
+
+        // visual only: the player's own collider handles physics
+        foreach (var col in ship.GetComponentsInChildren<Collider>()) Destroy(col);
+
+        var renderers = ship.GetComponentsInChildren<Renderer>();
+        if (renderers.Length == 0) return;
+
+        // the cockpit parts are named after the module ("Cockpit3_WithInterior", "CockpitEquipments_...")
+        bool found = false;
+        Bounds cockpit = default, all = default;
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            if (i == 0) all = renderers[0].bounds; else all.Encapsulate(renderers[i].bounds);
+
+            if (!IsCockpitPart(renderers[i].transform, ship.transform)) continue;
+            if (!found) { cockpit = renderers[i].bounds; found = true; }
+            else cockpit.Encapsulate(renderers[i].bounds);
+        }
+        if (!found) cockpit = all;
+
+        if (cockpitHeight > 0f && cockpit.size.y > 0.01f)
+            ship.transform.localScale = Vector3.one * (cockpitHeight / cockpit.size.y);
+
+        // re-measure after scaling; the pilot's head goes just above the seat ("CockpitEquipments_Seat"),
+        // falling back to the middle of the cockpit
+        Bounds anchor = default;
+        bool hasAnchor = false;
+        foreach (var r in renderers)
+        {
+            if (!HasNamedAncestor(r.transform, ship.transform, "Seat") || HasNamedAncestor(r.transform, ship.transform, "SeatEjector")) continue;
+            if (!hasAnchor) { anchor = r.bounds; hasAnchor = true; } else anchor.Encapsulate(r.bounds);
+        }
+        if (!hasAnchor)
+        {
+            foreach (var r in renderers)
+            {
+                if (found && !IsCockpitPart(r.transform, ship.transform)) continue;
+                if (!hasAnchor) { anchor = r.bounds; hasAnchor = true; } else anchor.Encapsulate(r.bounds);
+            }
+        }
+        FindLever(ship.transform);
+        FindSwitches(ship.transform);
+        Vector3 center = transform.InverseTransformPoint(anchor.center);
+        ship.transform.localPosition = eyePosition + seatOffset - center;
+        SetupCounter(ship.transform);
+    }
+
+    // Text written on the face of a cockpit gauge, readable from the pilot's seat.
+    class GaugeText
+    {
+        public TextMesh text;
+        public Renderer renderer;
+        public float face;
+        public bool needsFit;
+        public string shown;
+    }
+
+    GaugeText counter, timer;
+
+    GaugeText SetupGaugeText(Transform root, string screenName, Color color)
+    {
+        Transform screen = null;
+        foreach (var t in root.GetComponentsInChildren<Transform>())
+            if (t.name == screenName) { screen = t; break; }
+        var filter = screen != null ? screen.GetComponent<MeshFilter>() : null;
+        var gaugeRenderer = screen != null ? screen.GetComponent<Renderer>() : null;
+        if (filter == null || gaugeRenderer == null) return null;
+
+        // dial center, seen from the pilot: the digits sit on the line of sight to it, just in front of the gauge,
+        // so they look centered whichever way the dial's mesh is oriented
+        Vector3 center = gaugeRenderer.bounds.center;
+        Vector3 toEye = transform.TransformPoint(eyePosition) - center;
+        Vector3 view = toEye.normalized;
+
+        var gauge = screen.parent != null ? screen.parent : screen;
+        Bounds all = gaugeRenderer.bounds;
+        foreach (var r in gauge.GetComponentsInChildren<Renderer>()) all.Encapsulate(r.bounds);
+        float front = 0f;
+        for (int i = 0; i < 8; i++)
+        {
+            Vector3 corner = all.center + Vector3.Scale(all.extents, new Vector3((i & 1) * 2 - 1, ((i >> 1) & 1) * 2 - 1, ((i >> 2) & 1) * 2 - 1));
+            front = Mathf.Max(front, Vector3.Dot(corner - center, view));
+        }
+
+        Vector3 size = Vector3.Scale(filter.sharedMesh.bounds.size, screen.lossyScale);
+        var result = new GaugeText { face = Mathf.Max(size.x, size.y, size.z), needsFit = true };
+
+        if (blankGaugeFace) BlankFace(gaugeRenderer);
+
+        var go = new GameObject(screenName + "_Text");
+        go.transform.SetParent(root, true);
+        go.transform.position = center + view * (front + 0.004f);
+        go.transform.rotation = Quaternion.LookRotation(-view, transform.up);
+
+        var font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+        result.text = go.AddComponent<TextMesh>();
+        result.text.font = font;
+        result.text.fontSize = 64;
+        result.text.characterSize = 0.05f;
+        result.text.anchor = TextAnchor.MiddleCenter;
+        result.text.alignment = TextAlignment.Center;
+        result.text.color = color;
+        result.text.text = "0";
+        result.renderer = go.GetComponent<MeshRenderer>();
+        result.renderer.sharedMaterial = font.material;
+        result.renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+        result.renderer.material.renderQueue = 4000; // drawn after the cockpit, so nothing paints over the digits
+        return result;
+    }
+
+    void SetupCounter(Transform root)
+    {
+        counter = SetupGaugeText(root, counterGaugeName, counterColor);
+        timer = SetupGaugeText(root, timerGaugeName, timerColor);
+    }
+
+    // The dial numbers are painted into the texture, so give this gauge its own plain dark material.
+    static void BlankFace(Renderer face)
+    {
+        var materials = face.materials; // own copies: other gauges sharing the texture keep their dial
+        foreach (var m in materials)
+        {
+            foreach (var texture in new[] { "_BaseMap", "_MainTex", "_EmissionMap" })
+                if (m.HasProperty(texture)) m.SetTexture(texture, null);
+            foreach (var color in new[] { "_BaseColor", "_Color" })
+                if (m.HasProperty(color)) m.SetColor(color, new Color(0.02f, 0.03f, 0.04f));
+            if (m.HasProperty("_EmissionColor")) m.SetColor("_EmissionColor", Color.black);
+        }
+        face.materials = materials;
+    }
+
+    void SetGaugeText(GaugeText gauge, string value)
+    {
+        if (gauge == null) return;
+
+        // the text mesh only has a size after it has been built, so scale it to the gauge once that exists
+        float height = gauge.renderer.localBounds.size.y * gauge.text.transform.lossyScale.y;
+        if (gauge.needsFit && height > 0.0001f)
+        {
+            gauge.text.transform.localScale *= gauge.face * counterSize / height;
+            gauge.needsFit = false;
+        }
+
+        if (value == gauge.shown) return;
+        gauge.shown = value;
+        gauge.text.text = value;
+    }
+
+    void UpdateCounter()
+    {
+        SetGaugeText(counter, SpaceDebris.DestroyedCount.ToString());
+
+        if (timer == null) return;
+        float left = GameFlow.TimeLeft; // the match length and clock live in GameFlow
+        timer.text.color = left <= timerLowSeconds ? timerLowColor : timerColor;
+        SetGaugeText(timer, Mathf.CeilToInt(left).ToString());
+    }
+
+    // The right-hand lever: two handle meshes that tilt around the throttle base.
+    class WeaponSwitch
+    {
+        public Transform transform;
+        public Vector3 position;
+        public Quaternion rotation;
+        public Material[] materials;
+        public Color[] baseColors;
+        public Light glow;
+        public float angle;
+        public Renderer[] renderers;
+    }
+
+    WeaponSwitch[] switches;
+
+    static string ColorProperty(Material m) => m.HasProperty("_BaseColor") ? "_BaseColor" : "_Color";
+
+    void FindSwitches(Transform root)
+    {
+        switches = new WeaponSwitch[weaponSwitchNames.Length];
+        foreach (var t in root.GetComponentsInChildren<Transform>())
+        {
+            int i = System.Array.IndexOf(weaponSwitchNames, t.name);
+            if (i < 0) continue;
+
+            var sw = new WeaponSwitch { transform = t, position = t.localPosition, rotation = t.localRotation };
+            sw.renderers = t.GetComponentsInChildren<Renderer>();
+            sw.materials = new Material[sw.renderers.Length];
+            sw.baseColors = new Color[sw.renderers.Length];
+            for (int r = 0; r < sw.renderers.Length; r++)
+            {
+                sw.materials[r] = sw.renderers[r].material; // own copy, so only this switch changes
+                sw.baseColors[r] = sw.materials[r].HasProperty(ColorProperty(sw.materials[r]))
+                    ? sw.materials[r].GetColor(ColorProperty(sw.materials[r])) : Color.white;
+            }
+
+            var lightObject = new GameObject("SwitchGlow");
+            lightObject.transform.SetParent(t, false);
+            lightObject.transform.localPosition = Vector3.zero;
+            sw.glow = lightObject.AddComponent<Light>();
+            sw.glow.type = LightType.Point;
+            sw.glow.range = 0.5f;
+            sw.glow.enabled = false;
+
+            switches[i] = sw;
+        }
+        switchState = new int[switches.Length];
+        for (int i = 0; i < switchState.Length; i++) switchState[i] = -1;
+    }
+
+    // The selected weapon's switch tips sideways and glows in the weapon's color; the others stay up.
+    // The switch being pointed at gets the highlight color.
+    void UpdateSwitches()
+    {
+        if (switches == null || weapons == null) return;
+
+        for (int i = 0; i < switches.Length; i++)
+        {
+            var sw = switches[i];
+            if (sw == null) continue;
+
+            bool selected = i == weapons.CurrentWeapon;
+
+            sw.angle = Mathf.MoveTowards(sw.angle, selected ? switchTiltAngle : 0f, switchTiltSpeed * Time.deltaTime);
+            sw.transform.localPosition = sw.position;
+            sw.transform.localRotation = sw.rotation;
+            sw.transform.RotateAround(sw.transform.position, transform.forward, sw.angle);
+
+            int state = selected ? 2 : (hoverMask & (1 << i)) != 0 ? 1 : 0;
+            if (state == switchState[i]) continue;
+            switchState[i] = state;
+
+            Color color = state == 2 ? weapons.WeaponColor(i) : leverHighlight;
+            for (int m = 0; m < sw.materials.Length; m++)
+            {
+                var mat = sw.materials[m];
+                mat.SetColor(ColorProperty(mat), state == 0 ? sw.baseColors[m] : color);
+                if (state == 2)
+                {
+                    mat.EnableKeyword("_EMISSION");
+                    mat.SetColor("_EmissionColor", color * switchGlow);
+                }
+                else if (mat.HasProperty("_EmissionColor"))
+                {
+                    mat.SetColor("_EmissionColor", Color.black);
+                }
+            }
+            sw.glow.color = color;
+            sw.glow.intensity = switchGlow * 0.3f;
+            sw.glow.enabled = state == 2;
+        }
+    }
+
+    // index of the weapon switch the ray passes closest to (within switchPickRadius), or -1
+    int PickSwitch(Vector3 hand, Vector3 dir)
+    {
+        int best = -1;
+        float bestDistance = switchPickRadius;
+        for (int i = 0; i < switches.Length; i++)
+        {
+            if (switches[i] == null || switches[i].renderers.Length == 0) continue;
+
+            Bounds b = switches[i].renderers[0].bounds;
+            foreach (var r in switches[i].renderers) b.Encapsulate(r.bounds);
+
+            Vector3 to = b.center - hand;
+            float along = Vector3.Dot(to, dir);
+            if (along <= 0f) continue;
+
+            float distance = (to - dir * along).magnitude;
+            if (distance <= bestDistance) { best = i; bestDistance = distance; }
+        }
+        return best;
+    }
+
+    void FindLever(Transform root)
+    {
+        var handles = new System.Collections.Generic.List<Transform>();
+        foreach (var t in root.GetComponentsInChildren<Transform>())
+        {
+            if (t.name.Contains("ThrottleControl1-Handle")) handles.Add(t);
+            else if (t.name.Contains("ThrottleContro1-Base")) leverPivot = t;
+        }
+        if (leverPivot == null || handles.Count == 0) return;
+
+        leverHandles = handles.ToArray();
+        var found = new System.Collections.Generic.List<Renderer>();
+        foreach (var h in leverHandles) found.AddRange(h.GetComponentsInChildren<Renderer>());
+        leverRenderers = found.ToArray();
+        if (leverRenderers.Length == 0) { leverHandles = null; return; }
+        leverBlock = new MaterialPropertyBlock();
+        leverPositions = new Vector3[leverHandles.Length];
+        leverRotations = new Quaternion[leverHandles.Length];
+        for (int i = 0; i < leverHandles.Length; i++)
+        {
+            leverPositions[i] = leverHandles[i].localPosition;
+            leverRotations[i] = leverHandles[i].localRotation;
+        }
+    }
+
+    void Update()
+    {
+        if (player == null) return;
+
+        UpdateCounter();
+        if (!GameFlow.IsPlaying)
+        {
+            // menu / pause / result: the cockpit buttons are off, but remember the held buttons so
+            // a button still down when the game resumes does not count as a new press
+            hoverMask = 0;
+            foreach (var pointer in pointers)
+            {
+                pointer.holdingLever = pointer.hoverLever = false;
+                pointer.hoverSwitch = -1;
+                var device = UnityEngine.XR.InputDevices.GetDeviceAtXRNode(pointer.node);
+                pointer.wasDown = device.isValid &&
+                    device.TryGetFeatureValue(UnityEngine.XR.CommonUsages.primaryButton, out bool held) && held;
+            }
+            if (leverHandles != null) SetLeverTint(false);
+        }
+        else if (UnityEngine.XR.XRSettings.isDeviceActive)
+        {
+            hoverMask = 0;
+            bool leverActive = false;
+            foreach (var pointer in pointers)
+            {
+                UpdatePointer(pointer);
+                if (pointer.hoverSwitch >= 0) hoverMask |= 1 << pointer.hoverSwitch;
+                leverActive |= pointer.hoverLever || pointer.holdingLever;
+            }
+            if (leverHandles != null) SetLeverTint(leverActive);
+        }
+        UpdateSwitches();
+        if (leverHandles == null) return;
+
+        float target = (player.ThrottleLevel - 1) * leverAngleStep;
+        leverAngle = Mathf.MoveTowards(leverAngle, target, leverSpeed * Time.deltaTime);
+
+        // tilt around the ship's lateral axis, through the lever base (forward = top of the lever moves toward +Z)
+        Vector3 pivot = leverPivot.position;
+        Vector3 axis = transform.right;
+        for (int i = 0; i < leverHandles.Length; i++)
+        {
+            var h = leverHandles[i];
+            h.localPosition = leverPositions[i];
+            h.localRotation = leverRotations[i];
+            h.RotateAround(pivot, axis, leverAngle);
+        }
+    }
+
+    // VR: point the right controller at the lever, hold A and move the hand forward / back to change level.
+    // VR: point a controller at a control and press its first face button (A on the right, X on the left).
+    void UpdatePointer(Pointer pointer)
+    {
+        var device = UnityEngine.XR.InputDevices.GetDeviceAtXRNode(pointer.node);
+        if (!device.isValid ||
+            !device.TryGetFeatureValue(UnityEngine.XR.CommonUsages.devicePosition, out Vector3 handLocal) ||
+            !device.TryGetFeatureValue(UnityEngine.XR.CommonUsages.deviceRotation, out Quaternion rotLocal))
+        {
+            pointer.holdingLever = pointer.hoverLever = pointer.wasDown = false;
+            pointer.hoverSwitch = -1;
+            return;
+        }
+
+        // controller poses are relative to the tracking origin, which is the player (the camera is parented to it too)
+        Vector3 hand = transform.TransformPoint(handLocal);
+        Vector3 dir = (transform.rotation * rotLocal) * Vector3.forward;
+        device.TryGetFeatureValue(UnityEngine.XR.CommonUsages.primaryButton, out bool down);
+
+        bool pressed = down && !pointer.wasDown;
+        pointer.wasDown = down;
+
+        // weapon switches
+        pointer.hoverSwitch = switches != null ? PickSwitch(hand, dir) : -1;
+        if (pressed && pointer.hoverSwitch >= 0 && weapons != null)
+        {
+            weapons.SelectWeapon(pointer.hoverSwitch);
+            device.SendHapticImpulse(0, 0.4f, 0.05f);
+        }
+
+        // throttle lever (one hand at a time)
+        if (leverHandles == null) return;
+
+        bool otherHolds = false;
+        foreach (var other in pointers) otherHolds |= other != pointer && other.holdingLever;
+
+        Vector3 toLever = LeverCenter() - hand;
+        float along = Vector3.Dot(toLever, dir);
+        pointer.hoverLever = !otherHolds && pointer.hoverSwitch < 0 && along > 0f &&
+                             (toLever - dir * along).magnitude <= leverGrabRadius;
+
+        if (!down) pointer.holdingLever = false;
+        else if (pressed && pointer.hoverLever)
+        {
+            pointer.holdingLever = true;
+            pointer.grabHandAxis = Vector3.Dot(hand, transform.forward);
+            pointer.grabLevel = player.ThrottleLevel;
+            device.SendHapticImpulse(0, 0.3f, 0.05f);
+        }
+
+        if (pointer.holdingLever)
+        {
+            int level = pointer.grabLevel +
+                        Mathf.RoundToInt((Vector3.Dot(hand, transform.forward) - pointer.grabHandAxis) / leverTravelPerLevel);
+            level = Mathf.Clamp(level, 1, player.ThrottleLevels);
+            if (level != player.ThrottleLevel)
+            {
+                player.SetThrottle(level);
+                device.SendHapticImpulse(0, 0.5f, 0.06f);
+            }
+        }
+    }
+
+    Vector3 LeverCenter()
+    {
+        Bounds b = leverRenderers[0].bounds;
+        foreach (var r in leverRenderers) b.Encapsulate(r.bounds);
+        return b.center;
+    }
+
+    void SetLeverTint(bool on)
+    {
+        if (on == leverTinted) return;
+        leverTinted = on;
+        if (on) leverBlock.SetColor("_BaseColor", leverHighlight); else leverBlock.Clear();
+        foreach (var r in leverRenderers) r.SetPropertyBlock(on ? leverBlock : null);
+    }
+
+    static bool HasNamedAncestor(Transform t, Transform root, string part)
+    {
+        for (; t != null && t != root; t = t.parent)
+            if (t.name.Contains(part)) return true;
+        return false;
+    }
+
+    static bool IsCockpitPart(Transform t, Transform root)
+    {
+        for (; t != null && t != root; t = t.parent)
+            if (t.name.Contains("Cockpit")) return true;
+        return false;
     }
 
     void Build()
