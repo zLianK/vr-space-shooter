@@ -29,11 +29,20 @@ public class GameFlow : MonoBehaviour
     const float ButtonHeight = 0.085f;
     const float ButtonSpacing = 0.105f;
 
-    static readonly Color PanelColor = new Color(0.03f, 0.05f, 0.09f);
-    static readonly Color ButtonColor = new Color(0.12f, 0.2f, 0.32f);
-    static readonly Color ButtonHoverColor = new Color(0.1f, 0.6f, 0.75f);
-    static readonly Color TextColor = new Color(0.9f, 0.97f, 1f);
-    static readonly Color TitleColor = new Color(0.3f, 1f, 0.9f);
+    const float OpenSeconds = 0.18f;    // the panel "powers on" by unfolding vertically
+
+    // holographic ship terminal: translucent deep blue, cyan lines and text
+    // opaque: the cockpit HUD behind it is bright HDR emission, which shows through even 5% transparency
+    static readonly Color PanelColor = new Color(0.012f, 0.03f, 0.065f, 1f);
+    static readonly Color PanelEdgeColor = new Color(0.35f, 0.9f, 1f, 1f);
+    static readonly Color ButtonColor = new Color(0.1f, 0.5f, 0.65f, 0.16f);
+    static readonly Color ButtonEdgeColor = new Color(0.35f, 0.9f, 1f, 0.6f);
+    static readonly Color ButtonHoverColor = new Color(0.15f, 0.75f, 0.9f, 0.55f);
+    static readonly Color ButtonHoverEdgeColor = new Color(0.7f, 1f, 1f, 1f);
+    static readonly Color TextColor = new Color(0.85f, 0.95f, 1f);
+    static readonly Color TextHoverColor = Color.white;
+    static readonly Color TitleColor = new Color(0.4f, 0.95f, 1f);
+    static readonly Color DimColor = new Color(0.4f, 0.65f, 0.78f);
 
     public static GameFlow Instance { get; private set; }
     public static State Current => Instance != null ? Instance.state : State.Playing;
@@ -57,6 +66,7 @@ public class GameFlow : MonoBehaviour
         public Action action;
         public float y;
         public Renderer background;
+        public TextMesh text;
     }
 
     Transform panel;
@@ -65,6 +75,7 @@ public class GameFlow : MonoBehaviour
     Transform[] beams;
     int keyboardIndex;
     int hovered = -1;
+    float openedAt;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Create()
@@ -80,6 +91,7 @@ public class GameFlow : MonoBehaviour
         // survives the scene reload done by "Reiniciar" / "Jogar novamente"
         DontDestroyOnLoad(gameObject);
         SceneManager.sceneLoaded += OnSceneLoaded;
+        PlayerController.Recentered += PlacePanel; // VR: the head may be recentered after the menu opened
 
         ShowMenu(State.Menu);
     }
@@ -87,6 +99,7 @@ public class GameFlow : MonoBehaviour
     void OnDestroy()
     {
         SceneManager.sceneLoaded -= OnSceneLoaded;
+        PlayerController.Recentered -= PlacePanel;
         if (Instance == this) Instance = null;
         Time.timeScale = 1f;
     }
@@ -198,7 +211,9 @@ public class GameFlow : MonoBehaviour
         hovered = -1;
         BuildPanel();
         placeUntil = Time.unscaledTime + 1f; // the headset may not be tracking yet on the very first frame
+        openedAt = Time.unscaledTime;
         PlacePanel();
+        AnimatePanel();
     }
 
     void HideMenu()
@@ -216,74 +231,119 @@ public class GameFlow : MonoBehaviour
         panel = new GameObject("Menu").transform;
         panel.SetParent(transform, false);
 
-        string title, subtitle = null;
+        // eyebrow: small status line above the title, like a ship terminal header
+        string eyebrow, title, subtitle = null, score = null;
         switch (state)
         {
             case State.Paused:
+                eyebrow = "SISTEMAS EM ESPERA";
                 title = "PAUSADO";
-                buttons.Add(new Button { label = "Continuar", action = Resume });
-                buttons.Add(new Button { label = "Reiniciar", action = Restart });
-                buttons.Add(new Button { label = "Fechar", action = Quit });
+                buttons.Add(new Button { label = "CONTINUAR", action = Resume });
+                buttons.Add(new Button { label = "REINICIAR", action = Restart });
+                buttons.Add(new Button { label = "FECHAR", action = Quit });
                 break;
             case State.Finished:
+                eyebrow = "FIM DA MISSÃO";
                 title = "TEMPO ESGOTADO";
-                subtitle = "Asteroides destruídos: " + SpaceDebris.DestroyedCount;
-                buttons.Add(new Button { label = "Jogar novamente", action = Restart });
-                buttons.Add(new Button { label = "Fechar", action = Quit });
+                score = SpaceDebris.DestroyedCount.ToString();
+                buttons.Add(new Button { label = "JOGAR NOVAMENTE", action = Restart });
+                buttons.Add(new Button { label = "FECHAR", action = Quit });
                 break;
             default:
+                eyebrow = "MISSÃO  //  CINTURÃO DE ASTEROIDES";
                 title = "VR SPACE SHOOTER";
                 subtitle = "Destrua o máximo de asteroides em " + Mathf.RoundToInt(MatchSeconds) + " segundos";
-                buttons.Add(new Button { label = "Iniciar", action = StartMatch });
-                buttons.Add(new Button { label = "Fechar", action = Quit });
+                buttons.Add(new Button { label = "INICIAR", action = StartMatch });
+                buttons.Add(new Button { label = "FECHAR", action = Quit });
                 break;
         }
 
-        // layout from the top: title, optional line, buttons
-        float y = 0.19f;
-        float top = y + 0.08f;
-        MakeText("Title", title, new Vector3(0f, y, -0.012f), 0.06f, TitleColor, PanelWidth * 0.9f);
-        y -= 0.095f;
-        if (subtitle != null)
+        // layout from the top: eyebrow, title, divider, subtitle or score, buttons, footer
+        const float textZ = -0.012f;
+        float textWidth = PanelWidth * 0.86f;
+        float y = 0.2f;
+        float top = y + 0.06f;
+        MakeText("Eyebrow", eyebrow, new Vector3(0f, y, textZ), 0.022f, DimColor, textWidth);
+        y -= 0.06f;
+        MakeText("Title", title, new Vector3(0f, y, textZ), 0.062f, TitleColor, textWidth);
+        y -= 0.05f;
+
+        // divider: a faint line with a bright segment in the middle
+        MakeRect("Divider", new Vector2(0f, y), new Vector2(PanelWidth * 0.78f, 0.0015f), PanelEdgeColor * new Color(1f, 1f, 1f, 0.35f), DecorQueue);
+        MakeRect("DividerCenter", new Vector2(0f, y), new Vector2(0.12f, 0.003f), PanelEdgeColor, DecorQueue);
+        y -= 0.055f;
+
+        if (score != null)
         {
-            MakeText("Subtitle", subtitle, new Vector3(0f, y, -0.012f), 0.035f, TextColor, PanelWidth * 0.9f);
-            y -= 0.085f;
+            y -= 0.01f;
+            MakeText("Score", score, new Vector3(0f, y, textZ), 0.12f, TextHoverColor, textWidth);
+            y -= 0.07f;
+            MakeText("ScoreLabel", "ASTEROIDES DESTRUÍDOS", new Vector3(0f, y, textZ), 0.024f, DimColor, textWidth);
+            y -= 0.075f;
+        }
+        else if (subtitle != null)
+        {
+            MakeText("Subtitle", subtitle, new Vector3(0f, y, textZ), 0.03f, TextColor, textWidth);
+            y -= 0.075f;
         }
         else
         {
-            y -= 0.02f;
+            y -= 0.01f;
         }
 
         foreach (var b in buttons)
         {
             b.y = y;
-            var quad = MakeBox("Button", new Vector3(0f, y, -0.006f), new Vector3(ButtonWidth, ButtonHeight, 0.01f), ButtonColor);
-            b.background = quad.GetComponent<Renderer>();
-            MakeText("Label", b.label, new Vector3(0f, y, -0.014f), 0.04f, TextColor, ButtonWidth * 0.9f);
+            b.background = MakePanel("Button", new Vector2(0f, y), new Vector2(ButtonWidth, ButtonHeight),
+                                     ButtonColor, ButtonEdgeColor, ButtonQueue, chamfer: 0.014f, corner: 0.018f, glow: 0.012f, scanlines: 0f);
+            b.text = MakeText("Label", b.label, new Vector3(0f, y, textZ), 0.036f, TextColor, ButtonWidth * 0.86f);
             y -= ButtonSpacing;
         }
 
-        float bottom = y + ButtonSpacing - ButtonHeight * 0.5f - 0.05f;
-        MakeBox("Background", new Vector3(0f, (top + bottom) * 0.5f, 0f), new Vector3(PanelWidth, top - bottom, 0.01f), PanelColor);
+        y += ButtonSpacing - ButtonHeight * 0.5f - 0.045f;
+        MakeText("Footer", "SISTEMAS ONLINE   ·   SETOR 7G", new Vector3(0f, y, textZ), 0.017f, DimColor, textWidth);
+        float bottom = y - 0.035f;
+
+        MakePanel("Background", new Vector2(0f, (top + bottom) * 0.5f), new Vector2(PanelWidth, top - bottom),
+                  PanelColor, PanelEdgeColor, PanelQueue, chamfer: 0.035f, corner: 0.05f, glow: 0.03f, scanlines: 1f);
     }
 
-    Transform MakeBox(string name, Vector3 localPosition, Vector3 scale, Color color)
+    // A holographic panel (see the "Game/Menu Overlay" shader): fill, outline, corner brackets, cut corners.
+    Renderer MakePanel(string name, Vector2 position, Vector2 size, Color fill, Color edge, int queue,
+                       float chamfer, float corner, float glow, float scanlines)
     {
-        var box = GameObject.CreatePrimitive(PrimitiveType.Cube);
-        box.name = name;
-        Destroy(box.GetComponent<Collider>()); // picking is done by ray / plane math, not physics
-        box.transform.SetParent(panel, false);
-        box.transform.localPosition = localPosition;
-        box.transform.localScale = scale;
+        var r = MakeRect(name, position, size, fill, queue);
+        var m = r.material;
+        m.SetFloat("_Shape", 1f);
+        m.SetVector("_Size", size);
+        m.SetColor("_EdgeColor", edge);
+        m.SetFloat("_Chamfer", chamfer);
+        m.SetFloat("_Corner", corner);
+        m.SetFloat("_Glow", glow);
+        m.SetFloat("_Scanlines", scanlines);
+        return r;
+    }
 
-        var r = box.GetComponent<Renderer>();
+    // A flat colored rectangle on the panel, facing the pilot.
+    Renderer MakeRect(string name, Vector2 position, Vector2 size, Color color, int queue)
+    {
+        // a quad is seen from its -Z side, the side facing the pilot (the panel's +Z points away from them)
+        var quad = GameObject.CreatePrimitive(PrimitiveType.Quad);
+        quad.name = name;
+        Destroy(quad.GetComponent<Collider>()); // picking is done by ray / plane math, not physics
+        quad.transform.SetParent(panel, false);
+        quad.transform.localPosition = position;
+        quad.transform.localScale = new Vector3(size.x, size.y, 1f);
+
+        var r = quad.GetComponent<Renderer>();
         r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
         r.receiveShadows = false;
+        UseOverlayMaterial(r, queue);
         SetColor(r, color);
-        return box.transform;
+        return r;
     }
 
-    void MakeText(string name, string text, Vector3 localPosition, float height, Color color, float maxWidth)
+    TextMesh MakeText(string name, string text, Vector3 localPosition, float height, Color color, float maxWidth)
     {
         var go = new GameObject(name);
         go.transform.SetParent(panel, false);
@@ -302,9 +362,27 @@ public class GameFlow : MonoBehaviour
         var r = go.GetComponent<MeshRenderer>();
         r.sharedMaterial = font.material;
         r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-        r.material.renderQueue = 4000;
+        r.material.renderQueue = TextQueue;
+        // GUI/Text Shader reads its depth test from this property: Always = on top of the cockpit, like the panel
+        r.material.SetFloat("unity_GUIZTestMode", (float)UnityEngine.Rendering.CompareFunction.Always);
 
         go.AddComponent<FitTextWidth>().maxWidth = maxWidth;
+        return tm;
+    }
+
+    // Draw order on top of the cockpit: beams, then the panel, then its buttons and lines, then the text.
+    const int BeamQueue = 3999, PanelQueue = 4000, ButtonQueue = 4001, DecorQueue = 4001, TextQueue = 4002;
+
+    // A material asset (in Resources), so its shader is part of the build: the default material of
+    // CreatePrimitive is not, and renders pink (missing shader) in the player. Its shader ignores depth,
+    // so cockpit parts between the pilot and the menu (the HUD) never cover it.
+    static Material overlayMaterial;
+
+    static void UseOverlayMaterial(Renderer r, int queue)
+    {
+        if (overlayMaterial == null) overlayMaterial = Resources.Load<Material>("MenuOverlay");
+        if (overlayMaterial != null) r.sharedMaterial = overlayMaterial;
+        r.material.renderQueue = queue; // own instance, so each box can have its own color
     }
 
     static void SetColor(Renderer r, Color color)
@@ -335,7 +413,7 @@ public class GameFlow : MonoBehaviour
     Transform Origin()
     {
         var cam = Camera.main;
-        return cam != null ? cam.transform.parent : null; // the player: controller poses are relative to it
+        return cam != null ? cam.transform.parent : null; // the tracking space: controller poses are relative to it
     }
 
     void PlacePanel()
@@ -353,10 +431,20 @@ public class GameFlow : MonoBehaviour
         panel.rotation = Quaternion.LookRotation(forward, up);
     }
 
+    // Unfolds the panel from a thin line, like a hologram powering on (runs on unscaled time: the game is paused).
+    void AnimatePanel()
+    {
+        float t = Mathf.Clamp01((Time.unscaledTime - openedAt) / OpenSeconds);
+        float eased = 1f - (1f - t) * (1f - t) * (1f - t);
+        panel.localScale = new Vector3(Mathf.Lerp(0.6f, 1f, eased), Mathf.Lerp(0.02f, 1f, eased), 1f);
+    }
+
     void UpdateMenu()
     {
         if (panel == null) return;
         if (Time.unscaledTime < placeUntil) PlacePanel();
+        AnimatePanel();
+        Shader.SetGlobalFloat("_MenuTime", Time.unscaledTime); // drives the scanline sweep
 
         int hit = -1;
         bool clicked = false;
@@ -435,7 +523,13 @@ public class GameFlow : MonoBehaviour
         else if (step == 0) hovered = -1;
 
         for (int i = 0; i < buttons.Count; i++)
-            SetColor(buttons[i].background, i == keyboardIndex ? ButtonHoverColor : ButtonColor);
+        {
+            bool lit = i == keyboardIndex;
+            var m = buttons[i].background.material;
+            m.SetColor("_BaseColor", lit ? ButtonHoverColor : ButtonColor);
+            m.SetColor("_EdgeColor", lit ? ButtonHoverEdgeColor : ButtonEdgeColor);
+            buttons[i].text.color = lit ? TextHoverColor : TextColor;
+        }
     }
 
     void Activate(int index)
@@ -472,6 +566,7 @@ public class GameFlow : MonoBehaviour
         beam.transform.SetParent(transform, false);
         var r = beam.GetComponent<Renderer>();
         r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+        UseOverlayMaterial(r, BeamQueue);
         SetColor(r, TitleColor);
         return beam.transform;
     }

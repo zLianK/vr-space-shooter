@@ -18,6 +18,7 @@ Shader "Space/Dust"
             HLSLPROGRAM
             #pragma vertex vert
             #pragma fragment frag
+            #pragma multi_compile_instancing
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 
             CBUFFER_START(UnityPerMaterial)
@@ -29,18 +30,23 @@ Shader "Space/Dust"
                 float4 positionOS : POSITION;
                 half4 color : COLOR;
                 float2 uv : TEXCOORD0;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
             };
 
+            // the stereo macros let single-pass instanced VR draw it for both eyes
             struct Varyings
             {
                 float4 positionCS : SV_POSITION;
                 half4 color : COLOR;
                 float2 uv : TEXCOORD0;
+                UNITY_VERTEX_OUTPUT_STEREO
             };
 
             Varyings vert(Attributes v)
             {
                 Varyings o;
+                UNITY_SETUP_INSTANCE_ID(v);
+                UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
                 o.positionCS = TransformObjectToHClip(v.positionOS.xyz);
                 o.color = v.color;
                 o.uv = v.uv;
@@ -49,6 +55,7 @@ Shader "Space/Dust"
 
             half4 frag(Varyings i) : SV_Target
             {
+                UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(i);
                 float r = length(i.uv - 0.5) * 2.0;
                 half a = saturate(1.0 - r);
                 a *= a;

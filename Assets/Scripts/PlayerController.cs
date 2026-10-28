@@ -1,6 +1,8 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.InputSystem;
 using UnityEngine.InputSystem.XR;
+using UnityEngine.Serialization;
 using UnityEngine.XR;
 
 /// <summary>
@@ -11,8 +13,10 @@ using UnityEngine.XR;
 ///           Q/E = strafe, X = brake, Mouse = head look (turns your head, not the ship),
 ///           C = recenter head, Esc = release the mouse, click = capture it again.
 /// VR:       Right grip = accelerate (strength set by the lever), point the right controller at the
-///           throttle lever, hold A and move it forward / back to change level, Left stick = move/strafe, Right stick Y = up / down,
-///           Right stick X = turn, Left grip = brake. Head rotation is the look direction.
+///           throttle lever, hold A and move it forward / back to change level, Left stick = move/strafe,
+///           Right stick = flight stick (X = turn, push forward = nose down, pull back = nose up), Left grip = brake. The head only looks around:
+///           thrust and shots always follow the ship's nose.
+///           The headset is recentered on the pilot's seat at start (and with C or the runtime's own recenter).
 /// </summary>
 [RequireComponent(typeof(Rigidbody))]
 public class PlayerController : MonoBehaviour
@@ -38,9 +42,20 @@ public class PlayerController : MonoBehaviour
     [SerializeField] float maxHeadPitch = 60f;
 
     [Header("Camera")]
-    [Tooltip("Pilot's eye position (local to the player) when playing without a headset: first person, inside the cockpit.")]
-    [SerializeField] Vector3 desktopCameraOffset = new Vector3(0f, 0.1f, 0f);
+    [Tooltip("Pilot's eye position (local to the player): first person, inside the cockpit. " +
+             "In VR the headset is recentered onto this point, facing the ship's nose.")]
+    [FormerlySerializedAs("desktopCameraOffset")]
+    [SerializeField] Vector3 eyePosition = new Vector3(0f, 0.1f, 0f);
     [SerializeField] Transform view;
+
+    /// <summary>
+    /// VR: parent of the camera whose space the headset and controller poses are reported in.
+    /// It is offset so the tracked head lands on the pilot's eye. Desktop: the player itself.
+    /// </summary>
+    public Transform TrackingSpace { get; private set; }
+
+    /// <summary>Raised after the headset is recentered (things placed in front of the head can move along).</summary>
+    public static event System.Action Recentered;
 
     Rigidbody body;
     InputAction throttleUp, throttleDown, throttle1, throttle2, throttle3;
@@ -49,16 +64,21 @@ public class PlayerController : MonoBehaviour
 
     InputAction move, ascend, yaw, pitch, accelerate, mouseLook, recenter, brake;
     float headYaw, headPitch;
+    float yawInput, pitchInput;
     bool vr;
     Vector2 vrMove;
-    float vrUp, vrYaw, vrAccelerate;
+    float vrPitch, vrYaw, vrAccelerate;
     bool vrBrake;
+    bool recenterPending;
 
     void Awake()
     {
         body = GetComponent<Rigidbody>();
         body.useGravity = false;
         body.freezeRotation = true;
+        // physics runs at 50 Hz but a headset draws at 80-90 Hz: without interpolation the cockpit (and the
+        // camera inside it) moves in steps, which judders in VR
+        body.interpolation = RigidbodyInterpolation.Interpolate;
 
         if (view == null && Camera.main != null) view = Camera.main.transform;
         vr = XRSettings.isDeviceActive;
@@ -68,12 +88,20 @@ public class PlayerController : MonoBehaviour
 
     void SetupCamera()
     {
+        TrackingSpace = transform;
         if (view == null) return;
 
-        view.SetParent(transform, false);
+        // the default near plane (0.3 m) cuts away anything closer, like the pilot's hands and the cockpit
+        var cam = view.GetComponent<Camera>();
+        if (cam != null) cam.nearClipPlane = 0.02f;
+
         if (vr)
         {
-            // the headset drives the camera pose, relative to the player
+            // The headset drives the camera pose relative to the tracking space. Its origin is the runtime's
+            // (often the floor, facing the Guardian's forward), so RecenterHead moves it under the pilot's eye.
+            TrackingSpace = new GameObject("TrackingSpace").transform;
+            TrackingSpace.SetParent(transform, false);
+            view.SetParent(TrackingSpace, false);
             view.localPosition = Vector3.zero;
             view.localRotation = Quaternion.identity;
             if (view.GetComponent<TrackedPoseDriver>() == null)
@@ -84,12 +112,42 @@ public class PlayerController : MonoBehaviour
                 driver.rotationInput = new InputActionProperty(new InputAction("HeadRotation", binding: "<XRHMD>/centerEyeRotation"));
                 driver.enabled = true;
             }
+            recenterPending = true;
         }
         else
         {
-            view.localPosition = desktopCameraOffset;
+            view.SetParent(transform, false);
+            view.localPosition = eyePosition;
             view.localRotation = Quaternion.identity;
         }
+    }
+
+    // The runtime's own recenter (e.g. holding the Oculus button) moves the tracking origin, so redo ours.
+    void OnTrackingOriginUpdated(XRInputSubsystem _) => recenterPending = true;
+
+    // Puts the tracked head on the pilot's eye, facing the ship's nose. Only yaw is corrected:
+    // up stays the real up, so tilting the head still tilts the view.
+    bool RecenterHead()
+    {
+        var head = InputDevices.GetDeviceAtXRNode(XRNode.Head);
+        if (!head.isValid) return false;
+        // the device can exist a few frames before it tracks: a pose read then is just zeros
+        if (head.TryGetFeatureValue(UnityEngine.XR.CommonUsages.isTracked, out bool tracked) && !tracked) return false;
+        if (!head.TryGetFeatureValue(UnityEngine.XR.CommonUsages.centerEyePosition, out Vector3 position) &&
+            !head.TryGetFeatureValue(UnityEngine.XR.CommonUsages.devicePosition, out position))
+            return false;
+        if (!head.TryGetFeatureValue(UnityEngine.XR.CommonUsages.centerEyeRotation, out Quaternion rotation) &&
+            !head.TryGetFeatureValue(UnityEngine.XR.CommonUsages.deviceRotation, out rotation))
+            return false;
+
+        Vector3 forward = Vector3.ProjectOnPlane(rotation * Vector3.forward, Vector3.up);
+        if (forward.sqrMagnitude < 0.001f) return false; // looking straight up or down: wait for a usable heading
+
+        Quaternion correction = Quaternion.Inverse(Quaternion.LookRotation(forward, Vector3.up));
+        TrackingSpace.localRotation = correction;
+        TrackingSpace.localPosition = eyePosition - correction * position;
+        Recentered?.Invoke();
+        return true;
     }
 
     void CreateActions()
@@ -141,6 +199,7 @@ public class PlayerController : MonoBehaviour
         mouseLook.Enable(); recenter.Enable(); brake.Enable();
 
         if (!vr) Cursor.lockState = CursorLockMode.Locked;
+        foreach (var s in InputSubsystems()) s.trackingOriginUpdated += OnTrackingOriginUpdated;
     }
 
     void OnDisable()
@@ -149,13 +208,23 @@ public class PlayerController : MonoBehaviour
         mouseLook.Disable(); recenter.Disable(); brake.Disable();
 
         if (!vr) Cursor.lockState = CursorLockMode.None;
+        foreach (var s in InputSubsystems()) s.trackingOriginUpdated -= OnTrackingOriginUpdated;
+    }
+
+    static List<XRInputSubsystem> InputSubsystems()
+    {
+        var list = new List<XRInputSubsystem>();
+        SubsystemManager.GetSubsystems(list);
+        return list;
     }
 
     void Update()
     {
-        if (!GameFlow.IsPlaying) return; // menu, pause or result screen
+        // VR: C (keyboard) also recenters the headset, in menus too
+        if (vr && recenter.WasPressedThisFrame()) recenterPending = true;
+        if (vr && recenterPending && TrackingSpace != transform) recenterPending = !RecenterHead();
 
-        float dt = Time.deltaTime;
+        if (!GameFlow.IsPlaying) return; // menu, pause or result screen
 
         ReadVR();
         if (throttleUp.WasPressedThisFrame()) SetThrottle(ThrottleLevel + 1);
@@ -163,28 +232,18 @@ public class PlayerController : MonoBehaviour
         if (throttle1.WasPressedThisFrame()) SetThrottle(1);
         if (throttle2.WasPressedThisFrame()) SetThrottle(2);
         if (throttle3.WasPressedThisFrame()) SetThrottle(3);
-        float yawDelta = Mathf.Clamp(yaw.ReadValue<float>() + vrYaw, -1f, 1f) * turnSpeed * dt;
+        // applied in FixedUpdate, together with the movement, so the interpolated body turns smoothly
+        yawInput = Mathf.Clamp(yaw.ReadValue<float>() + vrYaw, -1f, 1f);
+        pitchInput = -Mathf.Clamp(pitch.ReadValue<float>() + vrPitch, -1f, 1f);
 
-        if (vr)
-        {
-            // in VR the head provides pitch/roll, so the body only turns around the vertical axis
-            transform.Rotate(0f, yawDelta, 0f, Space.World);
-            return;
-        }
-
-        float pitchDelta = -pitch.ReadValue<float>() * turnSpeed * dt;
-
-        // rotate around the ship's own axes so pitch and yaw have no limits (loops, barrel turns, etc.)
-        transform.Rotate(pitchDelta, yawDelta, 0f, Space.Self);
-
-        UpdateHeadLook();
+        if (!vr) UpdateHeadLook(); // in VR the headset moves the head
     }
 
     // Controllers are read through the legacy XR InputDevices API, which works with any OpenXR runtime
     // without needing an interaction profile enabled for the Input System layouts.
     void ReadVR()
     {
-        vrMove = Vector2.zero; vrUp = vrYaw = vrAccelerate = 0f; vrBrake = false;
+        vrMove = Vector2.zero; vrPitch = vrYaw = vrAccelerate = 0f; vrBrake = false;
         if (!vr) return;
 
         var left = InputDevices.GetDeviceAtXRNode(XRNode.LeftHand);
@@ -199,9 +258,10 @@ public class PlayerController : MonoBehaviour
         {
             if (right.TryGetFeatureValue(UnityEngine.XR.CommonUsages.primary2DAxis, out Vector2 stick))
             {
+                // flight stick, like an airplane: push forward = nose down, pull back = nose up
                 stick = Deadzone(stick);
                 vrYaw = stick.x;
-                vrUp = stick.y;
+                vrPitch = -stick.y;
             }
             if (right.TryGetFeatureValue(UnityEngine.XR.CommonUsages.grip, out float rg)) vrAccelerate = rg;
         }
@@ -241,14 +301,19 @@ public class PlayerController : MonoBehaviour
 
     void FixedUpdate()
     {
-        Vector2 m = Vector2.ClampMagnitude(move.ReadValue<Vector2>() + vrMove, 1f);
-        float up = Mathf.Clamp(ascend.ReadValue<float>() + vrUp, -1f, 1f);
+        // rotate around the ship's own axes so pitch and yaw have no limits (loops, barrel turns, etc.)
+        float step = turnSpeed * Time.fixedDeltaTime;
+        if (GameFlow.IsPlaying) body.MoveRotation(body.rotation * Quaternion.Euler(pitchInput * step, yawInput * step, 0f));
 
-        // VR: thrust follows the head. Desktop: the head only looks around, thrust follows the ship.
-        Transform reference = vr && view != null ? view : transform;
+        Vector2 m = Vector2.ClampMagnitude(move.ReadValue<Vector2>() + vrMove, 1f);
+        float up = Mathf.Clamp(ascend.ReadValue<float>(), -1f, 1f);
+
+        // thrust always follows the ship; the head (VR or mouse look) only looks around.
+        // body.rotation, not transform: with interpolation the transform lags a little behind the body
+        Quaternion ship = body.rotation;
         float boost = Mathf.Clamp01(accelerate.ReadValue<float>() + vrAccelerate);
         float forward = boost * ThrottleLevel / throttleLevels;
-        Vector3 wish = reference.right * m.x + reference.forward * (m.y + forward) + reference.up * up;
+        Vector3 wish = ship * Vector3.right * m.x + ship * Vector3.forward * (m.y + forward) + ship * Vector3.up * up;
         if (wish.sqrMagnitude > 1f) wish.Normalize();
 
         body.AddForce(wish * thrust, ForceMode.Acceleration);

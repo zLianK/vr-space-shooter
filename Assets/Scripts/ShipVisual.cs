@@ -7,9 +7,6 @@ using UnityEngine;
 ///
 /// The "Dashboard" child is the place for future gameplay UI: its "DashboardScreen" child is a flat
 /// surface facing the pilot (local +Y), ready for a world-space Canvas, a RenderTexture, etc.
-///
-/// Placeholder art until a real cockpit model exists: disable this component and add a proper mesh
-/// under the player.
 /// </summary>
 public class ShipVisual : MonoBehaviour
 {
@@ -486,9 +483,10 @@ public class ShipVisual : MonoBehaviour
             return;
         }
 
-        // controller poses are relative to the tracking origin, which is the player (the camera is parented to it too)
-        Vector3 hand = transform.TransformPoint(handLocal);
-        Vector3 dir = (transform.rotation * rotLocal) * Vector3.forward;
+        // controller poses are relative to the tracking space (the camera's parent, recentered on the pilot's seat)
+        Transform space = player != null && player.TrackingSpace != null ? player.TrackingSpace : transform;
+        Vector3 hand = space.TransformPoint(handLocal);
+        Vector3 dir = (space.rotation * rotLocal) * Vector3.forward;
         device.TryGetFeatureValue(UnityEngine.XR.CommonUsages.primaryButton, out bool down);
 
         bool pressed = down && !pointer.wasDown;
@@ -517,7 +515,8 @@ public class ShipVisual : MonoBehaviour
         else if (pressed && pointer.hoverLever)
         {
             pointer.holdingLever = true;
-            pointer.grabHandAxis = Vector3.Dot(hand, transform.forward);
+            // measured in ship space: in world space the hand moves with the flying ship and the lever would drift
+            pointer.grabHandAxis = transform.InverseTransformPoint(hand).z;
             pointer.grabLevel = player.ThrottleLevel;
             device.SendHapticImpulse(0, 0.3f, 0.05f);
         }
@@ -525,7 +524,7 @@ public class ShipVisual : MonoBehaviour
         if (pointer.holdingLever)
         {
             int level = pointer.grabLevel +
-                        Mathf.RoundToInt((Vector3.Dot(hand, transform.forward) - pointer.grabHandAxis) / leverTravelPerLevel);
+                        Mathf.RoundToInt((transform.InverseTransformPoint(hand).z - pointer.grabHandAxis) / leverTravelPerLevel);
             level = Mathf.Clamp(level, 1, player.ThrottleLevels);
             if (level != player.ThrottleLevel)
             {

@@ -2,8 +2,9 @@ using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
-/// TEMPORARY: scatters static asteroids around the origin so there are visual references to judge
-/// movement in empty space. Delete the "Space Debris" object once real level content exists.
+/// Scatters static asteroids around the origin: the targets of the match. Each rock gets a
+/// <see cref="Health"/> scaled by its size, and every rock shot down adds to <see cref="DestroyedCount"/>,
+/// the player's score (shown on the cockpit gauge and on the result screen).
 ///
 /// Runs in edit mode too, so the rocks are visible in the Scene view without pressing Play.
 /// The rocks are generated, not saved in the scene.

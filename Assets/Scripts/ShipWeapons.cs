@@ -13,7 +13,7 @@ using UnityEngine.XR;
 /// Three weapon types, chosen with the three switches on the left of the cockpit panel (VR: point and press A),
 /// keys 4 / 5 / 6 or the gamepad d-pad left / right. Stronger weapons fire more slowly.
 ///
-/// Bolts leave from each cannon and converge on a point ahead of the ship.
+/// Bolts leave from each cannon and converge on a point ahead of the ship's nose (never where the head looks).
 /// </summary>
 public class ShipWeapons : MonoBehaviour
 {
@@ -79,7 +79,6 @@ public class ShipWeapons : MonoBehaviour
     float nextLeft, nextRight;
     bool vr;
     bool wasCaptured;
-    Transform aim;
 
     void Awake()
     {
@@ -171,12 +170,6 @@ public class ShipWeapons : MonoBehaviour
         source.PlayOneShot(Weapon.clip, 1f);
     }
 
-    void Start()
-    {
-        // VR: shoot where you look. Desktop: the head only looks around, shots follow the ship.
-        aim = vr && Camera.main != null ? Camera.main.transform : transform;
-    }
-
     void OnEnable()
     {
         fireLeft.Enable();
@@ -241,7 +234,8 @@ public class ShipWeapons : MonoBehaviour
     void Fire(Vector3 localMuzzle)
     {
         Vector3 origin = transform.TransformPoint(localMuzzle);
-        Vector3 target = aim.position + aim.forward * convergeDistance;
+        // always aim along the ship's nose; the head (VR or mouse look) only looks around
+        Vector3 target = transform.position + transform.forward * convergeDistance;
         Vector3 direction = (target - origin).normalized;
 
         var weapon = Weapon;
