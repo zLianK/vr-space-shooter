@@ -9,12 +9,16 @@ using UnityEngine.XR;
 /// Zero-gravity movement for the player sphere. The same actions are bound to both
 /// keyboard/mouse (desktop simulation) and the XR controllers, so it works with or without a headset.
 ///
-/// Desktop:  1/2/3 = throttle lever level, Left Shift = accelerate, W/S = nose up/down, A/D = turn left/right,
+/// Desktop:  1/2/3 = throttle lever level, Left Shift = accelerate, W/S = nose up/down, A/D = turn left/right
+///           (the cockpit flight stick moves along: W pulls it back, S pushes it forward, A/D tilt it to the side),
 ///           Q/E = strafe, X = brake, Mouse = head look (turns your head, not the ship),
 ///           C = recenter head, Esc = release the mouse, click = capture it again.
 /// VR:       Right grip = accelerate (strength set by the lever), point the right controller at the
 ///           throttle lever, hold A and move it forward / back to change level, Left stick = move/strafe,
-///           Right stick = flight stick (X = turn, push forward = nose down, pull back = nose up), Left grip = brake. The head only looks around:
+///           Flight stick (in the cockpit, between the knees): put either hand on it, hold that hand's A / X and
+///           move the hand: forward = nose down, back = nose up, to the side = turn, diagonals mix both.
+///           Let go of the button to release it (it springs back to center). Without a stick in the cockpit
+///           the right thumbstick steers instead. Left grip = brake. The head only looks around:
 ///           thrust and shots always follow the ship's nose.
 ///           The headset is recentered on the pilot's seat at start (and with C or the runtime's own recenter).
 /// </summary>
@@ -62,12 +66,22 @@ public class PlayerController : MonoBehaviour
     public int ThrottleLevel { get; private set; } = 1;
     public int ThrottleLevels => throttleLevels;
 
+    /// <summary>
+    /// Flight stick deflection that steers the ship, -1..1 per axis: x = tilted right (turn right),
+    /// y = pushed forward (nose down). Comes from the keys / gamepad or from the hand holding the cockpit stick.
+    /// </summary>
+    public Vector2 Stick { get; private set; }
+
+    /// <summary>Set by <see cref="ShipVisual"/> when the cockpit has a stick: in VR the ship then only turns while a hand holds it.</summary>
+    public bool HasCockpitStick { get; set; }
+
     InputAction move, ascend, yaw, pitch, accelerate, mouseLook, recenter, brake;
     float headYaw, headPitch;
     float yawInput, pitchInput;
     bool vr;
-    Vector2 vrMove;
-    float vrPitch, vrYaw, vrAccelerate;
+    Vector2 vrMove, vrStick;
+    Vector2? heldStick;
+    float vrAccelerate;
     bool vrBrake;
     bool recenterPending;
 
@@ -224,17 +238,30 @@ public class PlayerController : MonoBehaviour
         if (vr && recenter.WasPressedThisFrame()) recenterPending = true;
         if (vr && recenterPending && TrackingSpace != transform) recenterPending = !RecenterHead();
 
-        if (!GameFlow.IsPlaying) return; // menu, pause or result screen
+        // the hand on the cockpit stick reports every frame it holds it (see HoldStick)
+        Vector2? held = heldStick;
+        heldStick = null;
+
+        if (!GameFlow.IsPlaying) // menu, pause or result screen
+        {
+            Stick = Vector2.zero;
+            return;
+        }
 
         ReadVR();
+        if (held.HasValue) vrStick = held.Value;
         if (throttleUp.WasPressedThisFrame()) SetThrottle(ThrottleLevel + 1);
         if (throttleDown.WasPressedThisFrame()) SetThrottle(ThrottleLevel - 1);
         if (throttle1.WasPressedThisFrame()) SetThrottle(1);
         if (throttle2.WasPressedThisFrame()) SetThrottle(2);
         if (throttle3.WasPressedThisFrame()) SetThrottle(3);
+
+        // W (nose up) pulls the stick back, S pushes it forward
+        Stick = new Vector2(Mathf.Clamp(yaw.ReadValue<float>() + vrStick.x, -1f, 1f),
+                            Mathf.Clamp(-pitch.ReadValue<float>() + vrStick.y, -1f, 1f));
         // applied in FixedUpdate, together with the movement, so the interpolated body turns smoothly
-        yawInput = Mathf.Clamp(yaw.ReadValue<float>() + vrYaw, -1f, 1f);
-        pitchInput = -Mathf.Clamp(pitch.ReadValue<float>() + vrPitch, -1f, 1f);
+        yawInput = Stick.x;
+        pitchInput = Stick.y;
 
         if (!vr) UpdateHeadLook(); // in VR the headset moves the head
     }
@@ -243,7 +270,7 @@ public class PlayerController : MonoBehaviour
     // without needing an interaction profile enabled for the Input System layouts.
     void ReadVR()
     {
-        vrMove = Vector2.zero; vrPitch = vrYaw = vrAccelerate = 0f; vrBrake = false;
+        vrMove = vrStick = Vector2.zero; vrAccelerate = 0f; vrBrake = false;
         if (!vr) return;
 
         var left = InputDevices.GetDeviceAtXRNode(XRNode.LeftHand);
@@ -256,13 +283,9 @@ public class PlayerController : MonoBehaviour
         }
         if (right.isValid)
         {
-            if (right.TryGetFeatureValue(UnityEngine.XR.CommonUsages.primary2DAxis, out Vector2 stick))
-            {
-                // flight stick, like an airplane: push forward = nose down, pull back = nose up
-                stick = Deadzone(stick);
-                vrYaw = stick.x;
-                vrPitch = -stick.y;
-            }
+            // no stick in the cockpit to grab: the thumbstick is the flight stick (push forward = nose down)
+            if (!HasCockpitStick && right.TryGetFeatureValue(UnityEngine.XR.CommonUsages.primary2DAxis, out Vector2 stick))
+                vrStick = Deadzone(stick);
             if (right.TryGetFeatureValue(UnityEngine.XR.CommonUsages.grip, out float rg)) vrAccelerate = rg;
         }
     }
@@ -270,6 +293,12 @@ public class PlayerController : MonoBehaviour
     public void SetThrottle(int level)
     {
         ThrottleLevel = Mathf.Clamp(level, 1, throttleLevels);
+    }
+
+    /// <summary>VR: called every frame while a hand holds the cockpit stick (x = right, y = forward). Not calling it lets go.</summary>
+    public void HoldStick(Vector2 deflection)
+    {
+        heldStick = Deadzone(Vector2.ClampMagnitude(deflection, 1f));
     }
 
     static Vector2 Deadzone(Vector2 v) => v.magnitude > 0.15f ? v : Vector2.zero;

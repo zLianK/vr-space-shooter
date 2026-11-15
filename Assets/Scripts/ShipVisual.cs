@@ -39,6 +39,16 @@ public class ShipVisual : MonoBehaviour
     [Tooltip("Tint of the lever while it is pointed at or held.")]
     [SerializeField] Color leverHighlight = new Color(1f, 0.8f, 0.2f);
 
+    [Header("Flight stick")]
+    [Tooltip("Degrees the stick tilts at full deflection (forward / back and to the sides).")]
+    [SerializeField] float stickMaxAngle = 20f;
+    [Tooltip("How fast the stick follows its input, in full deflections per second (also how fast it springs back to center).")]
+    [SerializeField] float stickSpeed = 8f;
+    [Tooltip("VR: how close (meters) the controller must be to the stick handle to grab it.")]
+    [SerializeField] float stickGrabRadius = 0.15f;
+    [Tooltip("VR: hand travel in meters (forward / back or sideways) for full deflection.")]
+    [SerializeField] float stickTravel = 0.07f;
+
     [Header("Weapon switches")]
     [Tooltip("Names of the three cockpit switches (left of the panel) that select weapon 1, 2 and 3.")]
     [SerializeField] string[] weaponSwitchNames =
@@ -88,16 +98,25 @@ public class ShipVisual : MonoBehaviour
     Renderer[] leverRenderers;
     MaterialPropertyBlock leverBlock;
     bool leverTinted;
+    Transform stickHandle;
+    Renderer stickBase;
+    Renderer[] stickRenderers;
+    Vector3 stickPosition;
+    Quaternion stickRotation;
+    Vector2 stickShown;
+    MaterialPropertyBlock stickBlock;
+    bool stickTinted;
 
     // One per controller: both hands can point at and press every cockpit control.
     // To add a control: pick it in UpdatePointer (ray test), react to `pressed` (rising edge) / `down` (held).
     class Pointer
     {
         public UnityEngine.XR.XRNode node;
-        public bool wasDown, holdingLever, hoverLever;
+        public bool wasDown, holdingLever, hoverLever, holdingStick, nearStick;
         public int hoverSwitch = -1;
         public float grabHandAxis;
         public int grabLevel;
+        public Vector3 grabStickHand;
     }
 
     readonly Pointer[] pointers =
@@ -162,6 +181,7 @@ public class ShipVisual : MonoBehaviour
             }
         }
         FindLever(ship.transform);
+        FindStick(ship.transform);
         FindSwitches(ship.transform);
         Vector3 center = transform.InverseTransformPoint(anchor.center);
         ship.transform.localPosition = eyePosition + seatOffset - center;
@@ -227,7 +247,9 @@ public class ShipVisual : MonoBehaviour
         result.renderer = go.GetComponent<MeshRenderer>();
         result.renderer.sharedMaterial = font.material;
         result.renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-        result.renderer.material.renderQueue = 4000; // drawn after the cockpit, so nothing paints over the digits
+        // drawn after the cockpit, so nothing paints over the digits, but before the menu panels (GameFlow, 3999+),
+        // so the digits never show through a menu
+        result.renderer.material.renderQueue = 3990;
         return result;
     }
 
@@ -419,6 +441,39 @@ public class ShipVisual : MonoBehaviour
         }
     }
 
+    // The joystick between the pilot's knees: a handle that tilts on its base.
+    void FindStick(Transform root)
+    {
+        foreach (var t in root.GetComponentsInChildren<Transform>())
+        {
+            if (t.name.Contains("Joystick2-Handle")) stickHandle = t;
+            else if (t.name.Contains("Joystick2-Base")) stickBase = t.GetComponent<Renderer>();
+        }
+        if (stickHandle == null || stickBase == null) { stickHandle = null; return; }
+
+        stickRenderers = stickHandle.GetComponentsInChildren<Renderer>();
+        if (stickRenderers.Length == 0) { stickHandle = null; return; }
+        stickBlock = new MaterialPropertyBlock();
+        stickPosition = stickHandle.localPosition;
+        stickRotation = stickHandle.localRotation;
+        if (player != null) player.HasCockpitStick = true;
+    }
+
+    // The stick shows the deflection that steers the ship, whether it comes from the hand (VR) or the keys.
+    void UpdateStick()
+    {
+        if (stickHandle == null) return;
+
+        stickShown = Vector2.MoveTowards(stickShown, player.Stick, stickSpeed * Time.deltaTime);
+
+        // pushed forward = top toward +Z (around the ship's lateral axis), tilted right = top toward +X
+        Vector3 pivot = stickBase.bounds.center;
+        stickHandle.localPosition = stickPosition;
+        stickHandle.localRotation = stickRotation;
+        stickHandle.RotateAround(pivot, transform.right, stickShown.y * stickMaxAngle);
+        stickHandle.RotateAround(pivot, transform.forward, -stickShown.x * stickMaxAngle);
+    }
+
     void Update()
     {
         if (player == null) return;
@@ -431,27 +486,31 @@ public class ShipVisual : MonoBehaviour
             hoverMask = 0;
             foreach (var pointer in pointers)
             {
-                pointer.holdingLever = pointer.hoverLever = false;
+                pointer.holdingLever = pointer.hoverLever = pointer.holdingStick = pointer.nearStick = false;
                 pointer.hoverSwitch = -1;
                 var device = UnityEngine.XR.InputDevices.GetDeviceAtXRNode(pointer.node);
                 pointer.wasDown = device.isValid &&
                     device.TryGetFeatureValue(UnityEngine.XR.CommonUsages.primaryButton, out bool held) && held;
             }
             if (leverHandles != null) SetLeverTint(false);
+            if (stickHandle != null) SetStickTint(false);
         }
         else if (UnityEngine.XR.XRSettings.isDeviceActive)
         {
             hoverMask = 0;
-            bool leverActive = false;
+            bool leverActive = false, stickActive = false;
             foreach (var pointer in pointers)
             {
                 UpdatePointer(pointer);
                 if (pointer.hoverSwitch >= 0) hoverMask |= 1 << pointer.hoverSwitch;
                 leverActive |= pointer.hoverLever || pointer.holdingLever;
+                stickActive |= pointer.nearStick || pointer.holdingStick;
             }
             if (leverHandles != null) SetLeverTint(leverActive);
+            if (stickHandle != null) SetStickTint(stickActive);
         }
         UpdateSwitches();
+        UpdateStick();
         if (leverHandles == null) return;
 
         float target = (player.ThrottleLevel - 1) * leverAngleStep;
@@ -478,7 +537,7 @@ public class ShipVisual : MonoBehaviour
             !device.TryGetFeatureValue(UnityEngine.XR.CommonUsages.devicePosition, out Vector3 handLocal) ||
             !device.TryGetFeatureValue(UnityEngine.XR.CommonUsages.deviceRotation, out Quaternion rotLocal))
         {
-            pointer.holdingLever = pointer.hoverLever = pointer.wasDown = false;
+            pointer.holdingLever = pointer.hoverLever = pointer.holdingStick = pointer.nearStick = pointer.wasDown = false;
             pointer.hoverSwitch = -1;
             return;
         }
@@ -491,6 +550,37 @@ public class ShipVisual : MonoBehaviour
 
         bool pressed = down && !pointer.wasDown;
         pointer.wasDown = down;
+
+        // flight stick (one hand at a time): grabbed with the hand itself, not the pointing ray.
+        // While held, the other cockpit controls ignore this hand.
+        if (stickHandle != null)
+        {
+            bool otherHoldsStick = false;
+            foreach (var other in pointers) otherHoldsStick |= other != pointer && other.holdingStick;
+
+            pointer.nearStick = !otherHoldsStick && !pointer.holdingLever &&
+                                Vector3.Distance(hand, StickCenter()) <= stickGrabRadius;
+
+            if (!down) pointer.holdingStick = false;
+            else if (pressed && pointer.nearStick)
+            {
+                pointer.holdingStick = true;
+                // measured in ship space: in world space the hand moves with the flying ship and the stick would drift
+                pointer.grabStickHand = transform.InverseTransformPoint(hand);
+                device.SendHapticImpulse(0, 0.3f, 0.05f);
+            }
+
+            if (pointer.holdingStick)
+            {
+                // from where it was grabbed: hand forward = stick pushed forward (nose down), back = nose up,
+                // sideways = tilted to that side (turn)
+                Vector3 moved = transform.InverseTransformPoint(hand) - pointer.grabStickHand;
+                player.HoldStick(new Vector2(moved.x, moved.z) / stickTravel);
+                pointer.hoverSwitch = -1;
+                pointer.hoverLever = false;
+                return;
+            }
+        }
 
         // weapon switches
         pointer.hoverSwitch = switches != null ? PickSwitch(hand, dir) : -1;
@@ -539,6 +629,21 @@ public class ShipVisual : MonoBehaviour
         Bounds b = leverRenderers[0].bounds;
         foreach (var r in leverRenderers) b.Encapsulate(r.bounds);
         return b.center;
+    }
+
+    Vector3 StickCenter()
+    {
+        Bounds b = stickRenderers[0].bounds;
+        foreach (var r in stickRenderers) b.Encapsulate(r.bounds);
+        return b.center;
+    }
+
+    void SetStickTint(bool on)
+    {
+        if (on == stickTinted) return;
+        stickTinted = on;
+        if (on) stickBlock.SetColor("_BaseColor", leverHighlight); else stickBlock.Clear();
+        foreach (var r in stickRenderers) r.SetPropertyBlock(on ? stickBlock : null);
     }
 
     void SetLeverTint(bool on)

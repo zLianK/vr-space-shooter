@@ -10,6 +10,7 @@ using XR = UnityEngine.XR;
 /// when the 120 seconds run out. Creates itself when the scene loads, so it needs no scene setup.
 ///
 /// The menus are simple 3D panels in front of the pilot, so they work in VR and on the desktop.
+/// The start and pause menus have a controls sheet beside them (Rift controls with a headset, keyboard otherwise).
 ///   VR:       point a controller at a button and pull the trigger (or press A / X).
 ///   Desktop:  mouse click, or Up / Down + Enter.   Gamepad: d-pad + south button.
 ///
@@ -31,6 +32,42 @@ public class GameFlow : MonoBehaviour
 
     const float OpenSeconds = 0.18f;    // the panel "powers on" by unfolding vertically
 
+    // controls sheet to the right of the start and pause menus
+    const float ControlsWidth = 0.56f;
+    const float ControlsGap = 0.03f;
+    const float ControlsRow = 0.034f;
+    const float ControlsKeyWidth = 0.15f;
+
+    // { key, what it does }; an empty key continues the row above
+    static readonly string[,] VRControls =
+    {
+        { "MANCHE", "encoste a mão e segure A / X" },
+        { "", "frente desce o bico  ·  trás sobe" },
+        { "", "para o lado: vira a nave" },
+        { "ACELERAR", "grip direito" },
+        { "ALAVANCA", "aponte, segure A e mova (força)" },
+        { "DESLIZAR", "analógico esquerdo" },
+        { "FREAR", "grip esquerdo" },
+        { "ATIRAR", "gatilho esquerdo / direito" },
+        { "ARMAS", "aponte para as chaves + A / X" },
+        { "PAUSAR", "botão menu (controle esquerdo)" },
+        { "RECENTRAR", "segure o botão Oculus" },
+    };
+
+    static readonly string[,] DesktopControls =
+    {
+        { "W / S", "bico sobe / desce" },
+        { "A / D", "virar a nave" },
+        { "Q / E", "deslizar para os lados" },
+        { "SHIFT", "acelerar" },
+        { "1 / 2 / 3", "força da alavanca" },
+        { "X", "frear" },
+        { "MOUSE ESQ / DIR", "canhão esquerdo / direito" },
+        { "4 / 5 / 6", "trocar arma" },
+        { "MOUSE", "olhar ao redor" },
+        { "ESC / P", "pausar" },
+    };
+
     // holographic ship terminal: translucent deep blue, cyan lines and text
     // opaque: the cockpit HUD behind it is bright HDR emission, which shows through even 5% transparency
     static readonly Color PanelColor = new Color(0.012f, 0.03f, 0.065f, 1f);
@@ -43,6 +80,7 @@ public class GameFlow : MonoBehaviour
     static readonly Color TextHoverColor = Color.white;
     static readonly Color TitleColor = new Color(0.4f, 0.95f, 1f);
     static readonly Color DimColor = new Color(0.4f, 0.65f, 0.78f);
+    static readonly Color TabSelectedColor = new Color(0.1f, 0.55f, 0.7f, 0.5f);
 
     public static GameFlow Instance { get; private set; }
     public static State Current => Instance != null ? Instance.state : State.Playing;
@@ -64,7 +102,9 @@ public class GameFlow : MonoBehaviour
     {
         public string label;
         public Action action;
-        public float y;
+        public float x, y;
+        public float width = ButtonWidth, height = ButtonHeight;
+        public bool selected; // a tab showing its page
         public Renderer background;
         public TextMesh text;
     }
@@ -76,6 +116,8 @@ public class GameFlow : MonoBehaviour
     int keyboardIndex;
     int hovered = -1;
     float openedAt;
+    float panelShift; // sideways offset so the menu and the controls sheet are centered together
+    bool showRiftControls; // controls sheet tab: Oculus Rift or keyboard / mouse
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Create()
@@ -93,6 +135,7 @@ public class GameFlow : MonoBehaviour
         SceneManager.sceneLoaded += OnSceneLoaded;
         PlayerController.Recentered += PlacePanel; // VR: the head may be recentered after the menu opened
 
+        showRiftControls = XR.XRSettings.isDeviceActive; // open the controls of what is being played on
         ShowMenu(State.Menu);
     }
 
@@ -306,6 +349,87 @@ public class GameFlow : MonoBehaviour
 
         MakePanel("Background", new Vector2(0f, (top + bottom) * 0.5f), new Vector2(PanelWidth, top - bottom),
                   PanelColor, PanelEdgeColor, PanelQueue, chamfer: 0.035f, corner: 0.05f, glow: 0.03f, scanlines: 1f);
+
+        // start and pause: show the controls, so whoever picks up the headset (or the keyboard) knows how to fly
+        bool controls = state == State.Menu || state == State.Paused;
+        panelShift = controls ? (ControlsGap + ControlsWidth) * 0.5f : 0f;
+        if (controls) BuildControls(top);
+    }
+
+    // Second panel to the right of the menu: title, two tabs (Oculus Rift / keyboard and mouse) and a
+    // two-column sheet for the selected tab, key on the left, what it does on the right.
+    // The tabs are buttons like the menu's: mouse, controller ray, or Left / Right arrows.
+    void BuildControls(float top)
+    {
+        var rows = showRiftControls ? VRControls : DesktopControls;
+
+        const float textZ = -0.012f;
+        const float pad = 0.035f;
+        float left = PanelWidth * 0.5f + ControlsGap;
+        float center = left + ControlsWidth * 0.5f;
+        float inner = ControlsWidth - pad * 2f;
+
+        float y = top - 0.065f;
+        MakeText("ControlsTitle", "CONTROLES", new Vector3(center, y, textZ), 0.05f, TitleColor, inner);
+        y -= 0.075f;
+
+        const float tabGap = 0.015f;
+        float tabWidth = (inner - tabGap) * 0.5f;
+        AddTab("OCULUS RIFT", true, center - (tabWidth + tabGap) * 0.5f, y, tabWidth);
+        AddTab("TECLADO E MOUSE", false, center + (tabWidth + tabGap) * 0.5f, y, tabWidth);
+        y -= 0.06f;
+        MakeRect("ControlsDivider", new Vector2(center, y), new Vector2(ControlsWidth * 0.78f, 0.0015f), PanelEdgeColor * new Color(1f, 1f, 1f, 0.35f), DecorQueue);
+        MakeRect("ControlsDividerCenter", new Vector2(center, y), new Vector2(0.12f, 0.003f), PanelEdgeColor, DecorQueue);
+        y -= 0.045f;
+
+        float keyX = left + pad;
+        float actionX = keyX + ControlsKeyWidth;
+        for (int i = 0; i < rows.GetLength(0); i++)
+        {
+            if (rows[i, 0].Length > 0)
+                AlignLeft(MakeText("Key", rows[i, 0], new Vector3(keyX, y, textZ), 0.02f, TitleColor, ControlsKeyWidth - 0.01f));
+            AlignLeft(MakeText("Action", rows[i, 1], new Vector3(actionX, y, textZ), 0.02f, TextColor, left + ControlsWidth - pad - actionX));
+            y -= ControlsRow;
+        }
+
+        float bottom = y + ControlsRow - 0.045f;
+        MakePanel("ControlsBackground", new Vector2(center, (top + bottom) * 0.5f), new Vector2(ControlsWidth, top - bottom),
+                  PanelColor, PanelEdgeColor, PanelQueue, chamfer: 0.035f, corner: 0.05f, glow: 0.03f, scanlines: 1f);
+    }
+
+    void AddTab(string label, bool rift, float x, float y, float width)
+    {
+        var tab = new Button
+        {
+            label = label, action = () => ShowControlsTab(rift),
+            x = x, y = y, width = width, height = 0.06f, selected = rift == showRiftControls,
+        };
+        tab.background = MakePanel("Tab", new Vector2(x, y), new Vector2(tab.width, tab.height),
+                                   ButtonColor, ButtonEdgeColor, ButtonQueue, chamfer: 0.01f, corner: 0.014f, glow: 0.01f, scanlines: 0f);
+        tab.text = MakeText("TabLabel", label, new Vector3(x, y, -0.012f), 0.024f, TextColor, width * 0.86f);
+        // the open tab is underlined by a bright bar
+        if (tab.selected)
+            MakeRect("TabUnderline", new Vector2(x, y - tab.height * 0.5f - 0.008f), new Vector2(width * 0.8f, 0.004f), PanelEdgeColor, DecorQueue);
+        buttons.Add(tab);
+    }
+
+    // Rebuilds the panel in place with the other controls page (same spot, no new unfold animation).
+    void ShowControlsTab(bool rift)
+    {
+        if (rift == showRiftControls || panel == null) return;
+        showRiftControls = rift;
+
+        panel.GetPositionAndRotation(out Vector3 position, out Quaternion rotation);
+        Vector3 scale = panel.localScale;
+        BuildPanel();
+        panel.SetPositionAndRotation(position, rotation);
+        panel.localScale = scale;
+    }
+
+    static void AlignLeft(TextMesh text)
+    {
+        text.anchor = TextAnchor.MiddleLeft;
+        text.alignment = TextAlignment.Left;
     }
 
     // A holographic panel (see the "Game/Menu Overlay" shader): fill, outline, corner brackets, cut corners.
@@ -427,8 +551,8 @@ public class GameFlow : MonoBehaviour
         if (forward.sqrMagnitude < 0.01f) forward = origin != null ? origin.forward : Vector3.forward;
         forward.Normalize();
 
-        panel.position = cam.transform.position + forward * PanelDistance;
         panel.rotation = Quaternion.LookRotation(forward, up);
+        panel.position = cam.transform.position + forward * PanelDistance - panel.right * panelShift;
     }
 
     // Unfolds the panel from a thin line, like a hologram powering on (runs on unscaled time: the game is paused).
@@ -507,6 +631,10 @@ public class GameFlow : MonoBehaviour
             if (Gamepad.current.dpad.down.wasPressedThisFrame) step = 1;
             if (Gamepad.current.dpad.up.wasPressedThisFrame) step = -1;
         }
+        // controls sheet tabs: Left = Oculus Rift, Right = keyboard and mouse
+        if (Keyboard.current != null && Keyboard.current.leftArrowKey.wasPressedThisFrame) ShowControlsTab(true);
+        if (Keyboard.current != null && Keyboard.current.rightArrowKey.wasPressedThisFrame) ShowControlsTab(false);
+
         if (step != 0)
         {
             keyboardIndex = (keyboardIndex + step + buttons.Count) % buttons.Count;
@@ -525,10 +653,11 @@ public class GameFlow : MonoBehaviour
         for (int i = 0; i < buttons.Count; i++)
         {
             bool lit = i == keyboardIndex;
-            var m = buttons[i].background.material;
-            m.SetColor("_BaseColor", lit ? ButtonHoverColor : ButtonColor);
-            m.SetColor("_EdgeColor", lit ? ButtonHoverEdgeColor : ButtonEdgeColor);
-            buttons[i].text.color = lit ? TextHoverColor : TextColor;
+            var b = buttons[i];
+            var m = b.background.material;
+            m.SetColor("_BaseColor", lit ? ButtonHoverColor : b.selected ? TabSelectedColor : ButtonColor);
+            m.SetColor("_EdgeColor", lit || b.selected ? ButtonHoverEdgeColor : ButtonEdgeColor);
+            b.text.color = lit ? TextHoverColor : b.selected ? TitleColor : TextColor;
         }
     }
 
@@ -552,7 +681,8 @@ public class GameFlow : MonoBehaviour
         Vector3 local = panel.InverseTransformPoint(origin + direction * distance);
         for (int i = 0; i < buttons.Count; i++)
         {
-            if (Mathf.Abs(local.x) <= ButtonWidth * 0.5f && Mathf.Abs(local.y - buttons[i].y) <= ButtonHeight * 0.5f)
+            var b = buttons[i];
+            if (Mathf.Abs(local.x - b.x) <= b.width * 0.5f && Mathf.Abs(local.y - b.y) <= b.height * 0.5f)
                 return i;
         }
         return -1;
